@@ -1,0 +1,33 @@
+{{- if .Values.clusterAdmin.enabled }}
+# cluster-admin for the default instance's application controller — the ServiceAccount that actually
+# applies manifests. This is the Red Hat-documented grant for an Argo CD that manages the whole cluster:
+#   oc adm policy add-cluster-role-to-user cluster-admin \
+#     -z openshift-gitops-argocd-application-controller -n openshift-gitops
+# expressed as the object that command creates, so it is in the release and reconciled on upgrade.
+#
+# The subject is named, not resolved: a ClusterRoleBinding may reference a ServiceAccount that does not
+# exist yet, and this one does not until the operator has reconciled the default instance. The binding
+# takes effect the moment the ServiceAccount appears. Wave 1: after the Subscription (0) — not because
+# the binding needs it, but so a sync that fails at the operator does not leave a cluster-admin grant
+# for an instance that never came.
+#
+# CLUSTER-ADMIN IS THE LAB'S CHOICE. On a shared cluster prefer the operator's own scoping
+# (ARGOCD_CLUSTER_CONFIG_NAMESPACES, above) plus namespace-level admin grants, or a user-defined
+# ClusterRole — see the Red Hat docs on customizing permissions. Set clusterAdmin.enabled=false there.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Values.clusterAdmin.bindingName }}
+  labels:
+    {{- include "openshift-gitops.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "openshift-gitops.controllerServiceAccount" . }}
+    namespace: {{ .Values.defaultInstance.namespace }}
+{{- end }}

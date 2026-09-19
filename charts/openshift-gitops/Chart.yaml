@@ -1,0 +1,19 @@
+apiVersion: v2
+name: openshift-gitops
+description: >-
+  Installs the Red Hat OpenShift GitOps operator through OLM, keeps the default Argo CD
+  instance the operator creates in openshift-gitops enabled, and binds that instance's
+  application controller to cluster-admin so it can manage the whole cluster.
+type: application
+# The CHART version. Bumped on every change to templates or defaults.
+version: 0.1.0
+# The operator channel this chart targets; the exact version is operator.startingCSV in values.yaml.
+appVersion: "latest"
+keywords:
+  - gitops
+  - argocd
+  - openshift
+  - olm
+maintainers:
+  - name: Platform Engineering
+home: https://docs.redhat.com/en/documentation/red_hat_openshift_gitops/latest/html-single/installing_gitops/index

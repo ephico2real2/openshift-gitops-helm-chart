@@ -1,0 +1,69 @@
+{{- if and .Values.verifyJob.enabled .Values.verifyJob.rbac.create }}
+# Read-only RBAC for the readiness verification Job, plus one write: SubjectAccessReview, which is how
+# the Job proves the cluster-admin grant took effect without impersonating anyone.
+#
+# Wave 1, and ORDINARY RESOURCES rather than hooks. Helm CREATES hook resources instead of applying
+# them and never records them in the release, so hooked RBAC survives `helm uninstall`, is never
+# reconciled on upgrade, and accumulates. Ordinary resources are also applied before any hook runs,
+# which is precisely the ordering a hook Job needs from its own ServiceAccount.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Release.Name }}-verify
+  namespace: {{ .Values.namespaces.operator }}
+  labels:
+    {{- include "openshift-gitops.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Release.Name }}-verify
+  labels:
+    {{- include "openshift-gitops.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+rules:
+  - apiGroups: ["operators.coreos.com"]
+    resources: ["subscriptions", "clusterserviceversions"]
+    verbs: ["get", "list", "watch"]
+  # THE INSTANCE READINESS SOURCE OF TRUTH. The ArgoCD CR's .status carries the operator's own
+  # verdict — phase Available, and one entry per component (applicationController, server, repo,
+  # redis, ...) reading Running. Reading it beats counting Deployments in the namespace, which cannot
+  # tell "all up" from "the first of several exists".
+  - apiGroups: ["argoproj.io"]
+    resources: ["argocds"]
+    verbs: ["get", "list", "watch"]
+  # The application controller's ServiceAccount: the subject the cluster-admin binding names, which
+  # only exists once the operator has reconciled the instance.
+  - apiGroups: [""]
+    resources: ["serviceaccounts"]
+    verbs: ["get"]
+  # The Argo CD server Route, logged so the run says where the UI is.
+  - apiGroups: ["route.openshift.io"]
+    resources: ["routes"]
+    verbs: ["get", "list"]
+  # `create` on SubjectAccessReview asks the API server "may this ServiceAccount do X?" — a question,
+  # not a grant, and it needs no impersonation. Used only when clusterAdmin.enabled is true.
+  - apiGroups: ["authorization.k8s.io"]
+    resources: ["subjectaccessreviews"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Release.Name }}-verify
+  labels:
+    {{- include "openshift-gitops.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ .Release.Name }}-verify
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Release.Name }}-verify
+    namespace: {{ .Values.namespaces.operator }}
+{{- end }}

@@ -1,0 +1,27 @@
+{{- if .Values.namespaces.create }}
+# ONE namespace, the operator's. The Argo CD instance namespace (openshift-gitops) is created by the
+# operator itself when it reconciles the default instance, and deleted by it when that instance is
+# removed — creating it here would give the namespace two owners and leave it behind unmanaged.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Values.namespaces.operator }}
+  annotations:
+    # Wave -2: before the OperatorGroup (-1) and the Subscription (0), because both live here.
+    # Deliberately NOT a Helm hook: Helm CREATES hook resources rather than applying them and never
+    # records them in the release, so a hooked namespace survives `helm uninstall` untracked and never
+    # has its labels reconciled on upgrade.
+    argocd.argoproj.io/sync-wave: "-2"
+    {{- if .Values.namespaces.protectOnUninstall }}
+    # KEEP ON UNINSTALL. This chart CREATES the namespace, so without this `helm uninstall` deletes it —
+    # and a namespace deletion takes everything inside it. Helm reads this from the STORED RELEASE
+    # MANIFEST, not the live object, so it has to be here and be stored by an upgrade. An empty
+    # namespace costs nothing and `oc delete ns` is one deliberate command away.
+    helm.sh/resource-policy: keep
+    {{- end }}
+  labels:
+    kubernetes.io/metadata.name: {{ .Values.namespaces.operator }}
+    # The operator's metrics are scraped by the platform Prometheus, as the Red Hat install docs label it.
+    openshift.io/cluster-monitoring: "true"
+    {{- include "openshift-gitops.labels" . | nindent 4 }}
+{{- end }}

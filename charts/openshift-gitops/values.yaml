@@ -1,0 +1,157 @@
+# Default values for openshift-gitops.
+#
+# What this chart does, in order (ArgoCD sync waves in brackets, Helm hook weights where a Job):
+#   [-2] the operator namespace          [-1] its OperatorGroup          [0] the Subscription
+#   [0, weight -6] csv-reclaim Job        [0, weight -5] installplan-approver Job
+#   [1]  cluster-admin for the default instance's application controller
+#   [2, weight 5] verify Job: operator installed, instance Available, grant proved
+
+# -----------------------------------------------------------------------------
+# Namespaces
+# -----------------------------------------------------------------------------
+namespaces:
+  # Create the operator namespace. Set false if your platform team pre-creates it (e.g. via GitOps).
+  create: true
+  # Namespace that hosts the OLM operator itself — the Red Hat docs' name since GitOps 1.10.
+  operator: openshift-gitops-operator
+  # Leave the namespace behind when the release is uninstalled. ON by default because this chart
+  # CREATES it and OLM leaves the CSV and the operator's own objects in it; deleting the namespace to
+  # remove a Subscription is a bigger action than `helm uninstall` should take on its own.
+  protectOnUninstall: true
+
+# -----------------------------------------------------------------------------
+# OLM operator install (OperatorGroup + Subscription)
+# -----------------------------------------------------------------------------
+operator:
+  enabled: true
+  # Subscription channel. `latest` follows the newest supported release; `gitops-1.21` pins a stream.
+  channel: latest
+  # OLM package name and catalog source. For this package the CSV names begin with the package name
+  # (openshift-gitops-operator.v1.21.4), unlike cert-manager's, but the approver reads
+  # .status.installedCSV rather than assuming it.
+  packageName: openshift-gitops-operator
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+  # Manual, deliberately, and paired with startingCSV below. Automatic means OLM approves and applies
+  # EVERY InstallPlan the channel produces — and `latest` is a ROLLING channel, so a new GitOps release
+  # installs itself, onto the cluster that deploys everything else, with no change in git and nobody's
+  # review. Manual on its own would block the FIRST install too: OLM stages an unapproved InstallPlan
+  # and waits for a human. The installPlanApprover Job below closes that, by approving ONLY the pinned
+  # version — so the version this chart declares installs unattended and anything else waits.
+  installPlanApproval: Manual
+  # THE VERSION YOU WANT RUNNING. To OLM it is where a FRESH install begins; to this chart it is the
+  # version the approver will approve and nothing else. Keep it at the exact name the catalog serves:
+  #   oc get packagemanifest openshift-gitops-operator -n openshift-marketplace -o jsonpath=\
+  #     '{range .status.channels[*]}{.name}{" -> "}{.currentCSV}{"\n"}{end}'
+  # Measured 2026-09-18 on OpenShift 4.22.7: latest -> openshift-gitops-operator.v1.21.4.
+  startingCSV: openshift-gitops-operator.v1.21.4
+  # OperatorGroup upgrade strategy. "Default" preserves OLM's standard behavior.
+  upgradeStrategy: Default
+  # Namespaces whose Argo CD instances may manage CLUSTER-SCOPED resources (platform operators, OLM
+  # operators, user management ...) — the operator's ARGOCD_CLUSTER_CONFIG_NAMESPACES. The default
+  # instance's namespace is the operator's own default; it is stated here so `oc get subscription -o
+  # yaml` says what the cluster wants. Add a namespace to let a user-defined instance there do the same.
+  clusterConfigNamespaces:
+    - openshift-gitops
+
+# -----------------------------------------------------------------------------
+# The default Argo CD instance
+# The operator creates one ready-to-use instance in openshift-gitops unless told not to. This chart
+# keeps it — that instance is the one the cluster-admin grant and the verify Job are about.
+# -----------------------------------------------------------------------------
+defaultInstance:
+  # true renders DISABLE_DEFAULT_ARGOCD_INSTANCE="false" on the Subscription; false renders "true", the
+  # Red Hat-documented way to run only user-defined instances. With false, clusterAdmin below is
+  # rendered against a ServiceAccount that will never exist — set clusterAdmin.enabled=false with it.
+  enabled: true
+  # Where the operator puts it, and what it calls it. Both are the operator's fixed choices, repeated
+  # here because the binding and the verify Job derive the controller ServiceAccount from them:
+  # <name>-argocd-application-controller in <namespace>.
+  namespace: openshift-gitops
+  name: openshift-gitops
+
+# -----------------------------------------------------------------------------
+# cluster-admin for the application controller
+# The ServiceAccount that applies manifests. cluster-admin is what a lab (CRC) wants so one Argo CD
+# can manage the whole cluster; on a shared cluster prefer clusterConfigNamespaces plus namespace-level
+# grants, or a user-defined ClusterRole, and set this false.
+# -----------------------------------------------------------------------------
+clusterAdmin:
+  enabled: true
+  bindingName: openshift-gitops-argocd-application-controller-cluster-admin
+
+# -----------------------------------------------------------------------------
+# Orphaned-CSV reclaim
+# `helm uninstall` removes the Subscription but OLM LEAVES THE CSV BEHIND with no ownerReferences, so
+# nothing garbage-collects it. The next install then cannot resolve — ResolutionFailed, "constraints
+# not satisfiable: @existing/..." — and no InstallPlan is ever staged, so the approver waits out its
+# whole budget for something that cannot arrive. This Job clears the orphan BEFORE the approver runs
+# (helm weight -6 vs -5). It deletes only on the six conditions in the template and never touches an
+# OLM copy.
+# -----------------------------------------------------------------------------
+csvReclaim:
+  enabled: true
+  image: registry.redhat.io/openshift4/ose-cli:latest
+  imagePullPolicy: IfNotPresent
+  # How long to wait for OLM to publish a verdict (installedCSV, or ResolutionFailed) before deciding.
+  # Sampling once would see neither straight after a sync and skip the reclaim entirely.
+  waitSeconds: 120
+  resources:
+    requests:
+      cpu: 25m
+      memory: 64Mi
+    limits:
+      cpu: 100m
+      memory: 128Mi
+
+# -----------------------------------------------------------------------------
+# InstallPlan approver
+# Approves ONLY the InstallPlan that installs operator.startingCSV, so a Manual-approval Subscription
+# still installs unattended while a channel upgrade waits for a human. Disable only if something else
+# approves InstallPlans for you — with installPlanApproval: Manual and no approver, the first install
+# hangs.
+# -----------------------------------------------------------------------------
+installPlanApprover:
+  enabled: true
+  image: registry.redhat.io/openshift4/ose-cli:latest
+  imagePullPolicy: IfNotPresent
+  # How long to wait for OLM to stage an InstallPlan for the pinned CSV, and then for that plan to
+  # complete. ONE budget for both, as with the verify Job.
+  waitSeconds: 600
+  # 0: every attempt polls the same state, so a retry re-waits from zero and turns one 10-minute
+  # failure into two with no new information.
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  resources:
+    requests:
+      cpu: 25m
+      memory: 64Mi
+    limits:
+      cpu: 100m
+      memory: 128Mi
+
+# -----------------------------------------------------------------------------
+# Verify Job
+# -----------------------------------------------------------------------------
+verifyJob:
+  enabled: true
+  # Image providing the `oc` binary. The Red Hat ose-cli image pulls on any entitled OpenShift/CRC
+  # cluster via the global pull secret.
+  image: registry.redhat.io/openshift4/ose-cli:latest
+  imagePullPolicy: IfNotPresent
+  # Overall wait budget, in seconds. The default instance takes a few minutes on a small cluster:
+  # measured on CRC, the operator CSV succeeded in under a minute and the instance reached Available
+  # some minutes after it, so 600 leaves headroom.
+  timeoutSeconds: 600
+  backoffLimit: 1
+  # Create the ServiceAccount + ClusterRole/Binding the Job needs. Disable if your platform provisions
+  # this RBAC out-of-band.
+  rbac:
+    create: true
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 250m
+      memory: 512Mi

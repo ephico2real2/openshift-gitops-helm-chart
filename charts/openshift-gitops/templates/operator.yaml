@@ -1,0 +1,60 @@
+{{- if .Values.operator.enabled }}
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: {{ .Values.namespaces.operator }}
+  namespace: {{ .Values.namespaces.operator }}
+  labels:
+    {{- include "openshift-gitops.labels" . | nindent 4 }}
+  annotations:
+    # Wave -1: before the Subscription, which cannot resolve without an OperatorGroup in its
+    # namespace. ArgoCD deletes in REVERSE wave order, so on removal the OperatorGroup outlives the
+    # Subscription — which is the order OLM wants.
+    argocd.argoproj.io/sync-wave: "-1"
+# No targetNamespaces: the operator's only install mode is AllNamespaces (measured on the catalog:
+# OwnNamespace, SingleNamespace and MultiNamespace are all unsupported), so the group must be global.
+spec:
+  upgradeStrategy: {{ .Values.operator.upgradeStrategy }}
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: {{ .Values.operator.packageName }}
+  namespace: {{ .Values.namespaces.operator }}
+  labels:
+    {{- include "openshift-gitops.labels" . | nindent 4 }}
+  annotations:
+    # Wave 0, and the InstallPlan approver shares it deliberately. With installPlanApproval: Manual,
+    # OLM leaves the first InstallPlan unapproved and this Subscription reports Progressing — ArgoCD's
+    # built-in health check for operators.coreos.com/Subscription forgives
+    # InstallPlanPending/RequiresApproval ONLY when .status.installedCSV is already set, i.e. an
+    # upgrade. On a first install it is nil, so an approver in any LATER wave would wait on the wave
+    # that is waiting on it. Same wave, and the sync progresses.
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  channel: {{ .Values.operator.channel }}
+  installPlanApproval: {{ .Values.operator.installPlanApproval }}
+  name: {{ .Values.operator.packageName }}
+  {{- with .Values.operator.startingCSV }}
+  # Pins the version OLM installs. Also the approver's authority: it approves an InstallPlan only if
+  # it installs this exact CSV.
+  startingCSV: {{ . }}
+  {{- end }}
+  source: {{ .Values.operator.source }}
+  sourceNamespace: {{ .Values.operator.sourceNamespace }}
+  # The operator reads its knobs from its own Deployment's environment, which OLM populates from
+  # here. Both are STATED rather than left to the operator's defaults, so `oc get subscription -o
+  # yaml` says what this cluster wants and a changed operator default cannot silently flip it.
+  config:
+    env:
+      # "false" keeps the default instance the operator creates in openshift-gitops. "true" is how the
+      # Red Hat docs disable it for clusters that run only user-defined instances.
+      - name: DISABLE_DEFAULT_ARGOCD_INSTANCE
+        value: {{ ternary "false" "true" .Values.defaultInstance.enabled | quote }}
+      # The instance namespaces the operator grants cluster-scoped management to (platform operators,
+      # OLM operators, user management ...). The default instance's namespace is in it by the operator's
+      # default; it is repeated here because this chart also binds that instance to cluster-admin, and
+      # the two settings belong side by side.
+      - name: ARGOCD_CLUSTER_CONFIG_NAMESPACES
+        value: {{ .Values.operator.clusterConfigNamespaces | join "," | quote }}
+{{- end }}

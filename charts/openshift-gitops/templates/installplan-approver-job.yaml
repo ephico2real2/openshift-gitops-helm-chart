@@ -1,0 +1,446 @@
+{{- if and .Values.operator.enabled .Values.installPlanApprover.enabled }}
+{{- if not .Values.operator.startingCSV }}
+{{- fail "installPlanApprover is enabled but operator.startingCSV is empty. The pin IS the approval authority — with nothing to match, the approver would either approve every InstallPlan the channel produces (defeating installPlanApproval: Manual) or approve none (hanging the install). Set operator.startingCSV, or set installPlanApprover.enabled=false and approve InstallPlans by another route." }}
+{{- end }}
+{{- /*
+     The pin's SHAPE is checked here, at render time, because a malformed pin fails in ways a log
+     cannot make obvious. Version COMPARISON survives both shapes below — the Job normalises each
+     side to its bare version (everything after the last `.v`, or after the first dot when no `.v`
+     exists) before ordering with `sort -V`, and all five mixed v/no-v orderings measured correct in
+     the Job's own image. What does NOT survive is APPROVAL: the search loop and the verify step
+     match operator.startingCSV against .spec.clusterServiceVersionNames and the CSV resource name
+     BYTE-FOR-BYTE, so a pin spelled differently from the catalog classifies correctly forever,
+     approves nothing, and burns the Job's whole budget instead of failing at render. Two shapes are
+     refused:
+
+       openshift-gitops-operator.1.21.4    no `.v`. Every CSV this package has ever published is
+                                        <package>.v<version> (115 of 115 in the catalog), so a v-less
+                                        pin is a typo today — and a typo the search loop would pay
+                                        for in 600 wasted seconds instead of a render error.
+       openshift-gitops-operator.v1.21.5-rc.1
+                                        `sort -V` is not semver-aware: a pre-release orders AFTER
+                                        the release it precedes. Measured in the Job's image: an rc
+                                        PIN against its own installed final classifies BEHIND, so
+                                        the Job would hunt for an InstallPlan OLM will never stage
+                                        and burn its entire budget. No such CSV has ever been
+                                        published either.
+
+     ── IF THE CATALOG ITSELF EVER DROPS THE `v` ──────────────────────────────────────────────────
+
+     The comparison side is already rename-proof, including the half-finished state where the
+     cluster runs v1.19.1 while the catalog offers 1.21.0 — bare numbers order that correctly, and
+     the same version spelled two ways is reported as installed, not as drift. The only edits needed
+     here: copy the exact new spelling from the catalog into operator.startingCSV, and relax the
+     regexMatch below to make the `v` optional. Do not relax it before the catalog actually renames —
+     the byte-for-byte argument above is version-independent. (An earlier note here prescribed
+     re-normalising both sides with a first-dot sed; superseded — and wrong for dotted package names,
+     turning my.pkg.v1.2.3 into pkg.v1.2.3 where the Job's last-`.v` split extracts 1.2.3.)
+
+     DO NOT "SIMPLIFY" THE COMPARISON BY PASSING THE TWO FULL CSV NAMES TO sort -V. Measured in the
+     Job's image: `sort -V` orders every v-less name before every v-ful one, so the `v` dominates the
+     comparison rather than the numbers —
+
+         openshift-gitops-operator.1.21.4     <- v-less first, whatever the version
+         openshift-gitops-operator.1.22.0
+         openshift-gitops-operator.v1.21.4     <- v-ful after, so 1.21.0 is judged OLDER than v1.19.1
+         openshift-gitops-operator.v1.22.0
+
+     Measured on the five mixed pairs: the full-name compare is wrong on three — exactly as many as
+     the sed comparison this release replaced, because the two return opposite verdicts on every
+     ordering pair and both fail the same-version-two-spellings pair — including calling a cluster
+     that is BEHIND its pin AHEAD. It trades one set of wrong answers for its mirror image. Bare
+     numbers or nothing.
+*/}}
+{{- if and .Values.operator.startingCSV (not (regexMatch "^.+\\.v[0-9]+(\\.[0-9]+)*$" .Values.operator.startingCSV)) }}
+{{- fail (printf "operator.startingCSV is %q, which is not a CSV name this chart can compare versions against. Expected <package>.v<numeric version> — for example openshift-gitops-operator.v1.21.4. The approver approves and verifies by matching this name byte-for-byte against what the catalog stages, so a spelling the catalog does not use approves nothing and the Job burns its whole budget waiting; and a pre-release suffix such as -rc.1 sorts AFTER the release it precedes under sort -V, so an rc pin against its own final classifies as an upgrade that can never arrive. Copy the exact name from the catalog: oc get packagemanifest %s -n %s -o 'custom-columns=CHANNEL:.status.channels[*].name,HEAD:.status.channels[*].currentCSV'. If that command shows the catalog itself no longer uses '.v' — every CSV is now <package>.1.2.3 — then this chart needs updating rather than working around, and the comment above this check says which regex to relax; the version comparison already handles a rename, but approval matches CSV names byte-for-byte, which is why an unexpected spelling refuses to render. To proceed without the approver meanwhile, set installPlanApprover.enabled=false and approve InstallPlans by another route." .Values.operator.startingCSV .Values.operator.packageName .Values.operator.sourceNamespace) }}
+{{- end }}
+# Approves ONLY the InstallPlan that installs operator.startingCSV.
+#
+# WHY IT EXISTS. installPlanApproval: Manual is the upgrade gate we want — a rolling channel must not install
+# a new operator version onto the cluster that deploys everything else, unreviewed. But Manual also blocks the FIRST
+# install: OLM stages an unapproved InstallPlan and waits for a human, so an unattended `helm install` never
+# completes and the verify Job (weight 5) times out waiting for a CSV that will never appear. Approving only
+# the pinned version gives both halves.
+#
+# ORDERING, and the two mechanisms are not interchangeable:
+#
+#   helm.sh/hook-weight: -5     the FIRST hook to run. The verify Job at weight 5 waits for
+#                               .status.installedCSV, which never appears until this approval happens, so
+#                               anything that gates on the operator must come after this.
+#   argocd sync-wave: 0         the SUBSCRIPTION'S OWN WAVE, deliberately. ArgoCD advances a wave only when
+#                               it is healthy, and a Manual-approval Subscription reports Progressing until
+#                               its InstallPlan is approved. ArgoCD's built-in health check for
+#                               operators.coreos.com/Subscription forgives InstallPlanPending/RequiresApproval
+#                               only when .status.installedCSV is already set — an UPGRADE awaiting approval.
+#                               On a first install it is nil, so at wave 1 this Job would wait on the wave
+#                               that is waiting on it, and the docs name the outcome: "it may be that the app
+#                               can never get to healthy."
+#   argocd hook: Sync           NOT PostSync, which runs only after the whole sync succeeds and all resources
+#                               are Healthy — unreachable while the Subscription is Progressing for want of
+#                               this very approval. And without ANY argocd hook annotation a Helm-hook Job is
+#                               an ordinary resource to ArgoCD, re-applied every sync, which fails on the
+#                               second one because a Job's spec.template is immutable.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}-installplan-approver
+  namespace: {{ .Values.namespaces.operator }}
+  labels:
+    {{- include "openshift-gitops.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+    argocd.argoproj.io/hook: Sync
+    # BeforeHookCreation is what makes the immutable spec.template moot: the previous run is deleted before
+    # this one is created. HookSucceeded keeps a FAILED run's pod log, which is the only place the reason
+    # lives.
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation,HookSucceeded
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  backoffLimit: {{ .Values.installPlanApprover.backoffLimit }}
+  # Above the script's own budget, so the script's message is the one you read rather than the kubelet
+  # killing the pod part-way with no explanation of its own.
+  activeDeadlineSeconds: {{ add .Values.installPlanApprover.waitSeconds 120 }}
+  ttlSecondsAfterFinished: {{ .Values.installPlanApprover.ttlSecondsAfterFinished }}
+  template:
+    metadata:
+      labels:
+        {{- include "openshift-gitops.labels" . | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ .Release.Name }}-installplan-approver
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      volumes:
+        - name: work
+          emptyDir:
+            medium: Memory
+      containers:
+        - name: approve
+          image: {{ .Values.installPlanApprover.image }}
+          imagePullPolicy: {{ .Values.installPlanApprover.imagePullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml .Values.installPlanApprover.resources | nindent 12 }}
+          volumeMounts:
+            - name: work
+              mountPath: /tmp
+          env:
+            # oc writes its discovery and OpenAPI cache here; the root filesystem is read-only.
+            - name: KUBECACHEDIR
+              value: /tmp/.kube/cache
+            # `required` on every identifier baked into the script below. A misspelled values key renders as
+            # an EMPTY STRING and does not fail — and an empty identifier does not error either, it simply
+            # makes every query match nothing. The Job then burns its whole budget and reports "no InstallPlan
+            # for the pinned CSV", which reads as an OLM problem. The sibling NCO chart shipped exactly that:
+            # a readiness Job read .Values.subscription.name when the key was packageName, and cost five
+            # minutes and a wrong diagnosis. `required` turns the same typo into a render-time error naming
+            # the key.
+            - name: NAMESPACE
+              value: {{ required "installPlanApprover: namespaces.operator must be set" .Values.namespaces.operator | quote }}
+            - name: SUBSCRIPTION
+              value: {{ required "installPlanApprover: operator.packageName must be set" .Values.operator.packageName | quote }}
+            - name: APPROVE_CSV
+              value: {{ required "installPlanApprover: operator.startingCSV must be set" .Values.operator.startingCSV | quote }}
+            # The Job's own ServiceAccount, so a Forbidden message can print the exact `can-i` probe
+            # rather than a guess. It is not the Subscription name — an earlier draft used that and would
+            # have sent a reader to check permissions for an account that does not exist.
+            - name: SA_NAME
+              value: {{ .Release.Name }}-installplan-approver
+            - name: WAIT_SECONDS
+              value: {{ required "installPlanApprover: installPlanApprover.waitSeconds must be set" .Values.installPlanApprover.waitSeconds | quote }}
+          command:
+            - /bin/bash
+            - -c
+            - |
+              # No `set -e`: every failure below reports the command to run next, which is more use than an
+              # exit code. `set -u` still catches an unset variable, and pipefail a broken pipeline.
+              set -uo pipefail
+
+              : "${NAMESPACE:?}" "${SUBSCRIPTION:?}" "${APPROVE_CSV:?}" "${WAIT_SECONDS:?}" "${SA_NAME:?}"
+
+              log()  { printf '[approver %s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
+              fail() { printf '[approver] FAILED: %s\n' "$*" >&2; exit 1; }
+
+              # ONE budget for the whole script, not one per stage. Two loops each free to consume
+              # WAIT_SECONDS would total 2x the documented number, at which point activeDeadlineSeconds kills
+              # the pod part-way with no message of its own.
+              DEADLINE=$(( $(date +%s) + WAIT_SECONDS ))
+              out_of_time() { [ "$(date +%s)" -ge "$DEADLINE" ]; }
+
+              # EVERY RESOURCE NAMED IN FULL. A plural is not reserved: measured on a live cluster in a
+              # sibling chart, `oc get subscription` bound to subscriptions.messaging.knative.dev and returned
+              # Forbidden, which reads as missing RBAC on the resource you meant. This container points
+              # KUBECACHEDIR at a fresh emptyDir, so discovery is COLD on every run and the binding is not
+              # stable even between two runs of this same Job.
+              SUBS=subscriptions.operators.coreos.com
+              PLANS=installplans.operators.coreos.com
+              CSVS=clusterserviceversions.operators.coreos.com
+
+              log "namespace=${NAMESPACE} subscription=${SUBSCRIPTION} approving-only=${APPROVE_CSV} budget=${WAIT_SECONDS}s"
+
+              # --- 1. is approval even ours to do? ------------------------------------------------------
+              # AN EMPTY READ IS NOT "Automatic". `-o jsonpath ... 2>/dev/null || true` collapses three
+              # different states into one empty string: the field genuinely absent (OLM defaults to Automatic
+              # — nothing to do), the Subscription not there (this hook ran before the resource it depends
+              # on), and the read failing (Forbidden, a wrong namespace, an API timeout). Only the first is
+              # "nothing to do"; reporting the other two as a successful no-op means the operator never
+              # installs and the log points AWAY from the cause. Keep the exit status and branch on it.
+              if ! MODE="$(oc get "$SUBS" "$SUBSCRIPTION" -n "$NAMESPACE" -o jsonpath='{.spec.installPlanApproval}' 2>&1)"; then
+                case "$MODE" in
+                  *NotFound*|*"not found"*)
+                    fail "Subscription ${SUBSCRIPTION} does not exist in ${NAMESPACE}.
+                This Job runs at helm hook-weight -5 and ArgoCD sync-wave 0, both AFTER the Subscription is applied, so
+                if it is missing then operator.packageName does not match the Subscription this chart creates, or the
+                release was applied with operator.enabled=false.
+                Inspect: oc get ${SUBS} -n ${NAMESPACE}" ;;
+                  *)
+                    fail "could not read Subscription ${SUBSCRIPTION} in ${NAMESPACE}: ${MODE}
+                The resource is named in full, so a Forbidden here means this ServiceAccount lacks 'get' on
+                subscriptions in the operators.coreos.com group.
+                          Inspect: oc auth can-i get ${SUBS} -n ${NAMESPACE} --as=system:serviceaccount:${NAMESPACE}:${SA_NAME}" ;;
+                esac
+              fi
+              if [ "$MODE" != "Manual" ]; then
+                log "approval mode is '${MODE:-Automatic (field absent)}', not Manual — OLM approves its own InstallPlans. Nothing to do."
+                exit 0
+              fi
+
+              # --- 1b. does the live Subscription still carry the pin this chart declares? --------------
+              # A HELM UPGRADE CANNOT SELF-HEAL THIS FIELD. That is why a Job has to check it.
+              #
+              # Ordinary resources are applied before hooks, so an upgrade that FAILS at a hook has ALREADY
+              # written the Subscription. Helm then computes its three-way merge against the last DEPLOYED
+              # release, not the failed one — so if you REVERT to the value that release carried, base and
+              # new agree, the field never enters the patch, and what the failed apply wrote stays. Measured:
+              # a pin planted at v1.17.1 survived a clean `helm upgrade` rendering v1.19.1, and every upgrade
+              # after it. Narrow but real: pinning a THIRD value is a genuine diff and DOES get patched
+              # (also measured — live v1.17.1 was overwritten by an upgrade rendering v1.18.1), which is why
+              # the ordinary bump-and-move-forward path never hits this.
+              #
+              # WARN, NOT FAIL: OLM reads startingCSV only when there is no installed CSV, so the drift is
+              # inert while the operator is running — failing here would block upgrades over a latent issue.
+              # The day it stops being latent is a REINSTALL, where OLM would begin at the stale version.
+              SPEC_PIN="$(oc get "$SUBS" "$SUBSCRIPTION" -n "$NAMESPACE" -o jsonpath='{.spec.startingCSV}' 2>/dev/null || true)"
+              if [ -n "$SPEC_PIN" ] && [ "$SPEC_PIN" != "$APPROVE_CSV" ]; then
+                # The remediation is a JSON patch, and JSON needs double quotes — the one character that
+                # cannot appear raw in these messages. Building it from a variable keeps the message itself
+                # quote-free, so it cannot repeat the escaping bug that turned a `fail` into a file write.
+                DQ='"'
+                PATCH="{${DQ}spec${DQ}:{${DQ}startingCSV${DQ}:${DQ}${APPROVE_CSV}${DQ}}}"
+                log "WARNING: the Subscription on the cluster pins ${SPEC_PIN}, but this chart declares ${APPROVE_CSV}."
+                log "  Helm will not reconcile this on its own — see the note above this check. It is inert while"
+                log "  the operator is installed, because OLM consults startingCSV only on a FRESH install."
+                log "  But a reinstall of this operator would begin at ${SPEC_PIN} instead of ${APPROVE_CSV}."
+                log "  Fix: oc patch ${SUBS} ${SUBSCRIPTION} -n ${NAMESPACE} --type merge -p '${PATCH}'"
+              fi
+
+              # Reports any unapproved InstallPlan this Job will NOT approve, and why. Deliberately never
+              # silent: refusing a plan for an unpinned version is the entire point of the gate, but a
+              # refusal nobody logs is indistinguishable from an approver that failed to notice — which is
+              # exactly how it was reported in the sibling chart.
+              report_unapproved_others() {
+                local found=0 ip owner approved names
+                for ip in $(oc get "$PLANS" -n "$NAMESPACE" -o name 2>/dev/null || true); do
+                  owner="$(oc get "$ip" -n "$NAMESPACE" -o jsonpath='{.metadata.ownerReferences[?(@.kind=="Subscription")].name}' 2>/dev/null || true)"
+                  case " $owner " in *" $SUBSCRIPTION "*) ;; *) continue ;; esac
+                  approved="$(oc get "$ip" -n "$NAMESPACE" -o jsonpath='{.spec.approved}' 2>/dev/null || true)"
+                  [ "$approved" = "true" ] && continue
+                  names="$(oc get "$ip" -n "$NAMESPACE" -o jsonpath='{.spec.clusterServiceVersionNames[*]}' 2>/dev/null || true)"
+                  case " $names " in
+                    *" $APPROVE_CSV "*) ;;
+                    *) found=1
+                       log "PENDING UPGRADE, deliberately NOT approved: ${ip} installs [${names}]."
+                       log "  The pin is the approval authority — this Job only ever approves ${APPROVE_CSV}, so a"
+                       log "  channel upgrade cannot install itself onto the cluster whose deployments it drives."
+                       log "  To adopt it: bump operator.startingCSV to the version above, review, merge." ;;
+                  esac
+                done
+                [ "$found" = 0 ] && log "no other unapproved InstallPlans are waiting"
+                return 0
+              }
+
+              # --- 2. already at the pin? --------------------------------------------------------------
+              # THREE CASES, not two. An earlier version tested only `installed == pin` and fell through to
+              # the search loop otherwise — so when the cluster was running a version the pin had been
+              # overtaken by, it hunted for an InstallPlan that OLM will never stage (there is no downgrade
+              # path) and burned its entire budget before failing with a message about the channel. Reported
+              # from a real 4.20 cluster: installedCSV=v1.20.0, pin=v1.19.1, six minutes of
+              # "waiting for OLM to stage an InstallPlan for v1.19.1".
+              #
+              # operator.startingCSV is OLM's STARTING point, not a ceiling — once the operator is past it,
+              # that version is history. So a mismatch has to be classified, not waited on.
+              INSTALLED="$(oc get "$SUBS" "$SUBSCRIPTION" -n "$NAMESPACE" -o jsonpath='{.status.installedCSV}' 2>/dev/null || true)"
+              if [ "$INSTALLED" = "$APPROVE_CSV" ]; then
+                log "already installed at ${APPROVE_CSV}; no InstallPlan to approve"
+                # Before the search loop, which is the only other place a non-matching plan gets logged. In
+                # the steady state — installed at the pin, an upgrade waiting in the channel — skipping this
+                # would make a deliberate refusal look like an oversight.
+                report_unapproved_others
+                exit 0
+              fi
+
+              if [ -n "$INSTALLED" ]; then
+                # Bare version out of a CSV name: openshift-gitops-operator.v1.21.4 -> 1.19.1. Bash case and
+                # parameter expansion — no sed, no fork. The stripping is load-bearing, not cosmetic:
+                # measured in this image, `sort -V` orders EVERY v-less name before EVERY v-ful one, so on
+                # raw names the `v` outvotes the numbers — only bare versions compare honestly if the
+                # catalog ever drops its `v`.
+                #
+                # The first branch splits at the LAST `.v` (## strips the longest prefix), so a dotted
+                # package name cannot bleed into the version. The v-less fallback can only anchor on the
+                # FIRST dot — right for every undotted package name. The guard at the top of this file
+                # refuses v-less PINS, but installedCSV is written by the cluster, out of any render-time
+                # check's reach, so here it has to be tolerated rather than rejected.
+                csv_version() {
+                  local ver
+                  case "$1" in
+                    *.v[0-9]*) printf '%s' "${1##*.v}" ;;
+                    *.*)       ver="${1#*.}"; printf '%s' "${ver#v}" ;;
+                    *)         printf '%s' "$1" ;;
+                  esac
+                }
+                inst_v="$(csv_version "$INSTALLED")"
+                want_v="$(csv_version "$APPROVE_CSV")"
+
+                if [ "$inst_v" = "$want_v" ]; then
+                  # Same version behind two DIFFERENT names, and the reader cannot be assumed to know
+                  # which case they are in: a catalog rename that dropped the `v` (spelling), or a pin
+                  # that names the wrong package outright at a version the real operator happens to
+                  # share. The message states both causes and prints both names whole rather than
+                  # computing which segment differs — the names sit side by side, and the remedy is
+                  # identical either way: make the pin byte-for-byte what the cluster reports, because
+                  # the approve and verify steps below match CSV names exactly, so a pin the catalog
+                  # never stages can classify forever yet never approve anything.
+                  log "already installed at version ${inst_v} — but the installed CSV is named ${INSTALLED} and the pin says ${APPROVE_CSV}"
+                  log "  the difference is either a v dropped by a catalog rename or a pin naming the wrong package;"
+                  log "  either way, update operator.startingCSV to the exact name the cluster reports — approval"
+                  log "  matches CSV names byte-for-byte, so they must agree before the next upgrade"
+                  report_unapproved_others
+                  exit 0
+                fi
+
+                # `sort -V` stays (GNU coreutils 8.30 in this image): 1.9 before 1.10 needs a version
+                # compare, not a string compare. Equality is settled above, so tail -1 is the strictly
+                # newer of the two.
+                newer="$(printf '%s\n%s\n' "$inst_v" "$want_v" | sort -V | tail -1)"
+                if [ "$newer" = "$inst_v" ]; then
+                  # AHEAD. OLM does not downgrade, so no InstallPlan for the pin can ever appear. This is real
+                  # drift — with installPlanApproval: Manual the operator cannot have upgraded itself, so
+                  # either a human approved a plan or the operator predates this release adopting it.
+                  #
+                  # WARN AND CONTINUE, not fail. An earlier version failed here. Failing blocks every later
+                  # `helm upgrade` — and every ArgoCD sync — on a condition this Job cannot fix and that is
+                  # not itself harmful: the operator is running, newer than asked, and nothing this Job does
+                  # would change that. Blocking the release does not correct the pin; only a commit does.
+                  #
+                  # EXIT 0 RATHER THAN FALL THROUGH. The search loop below would hunt for an InstallPlan OLM
+                  # will never stage and burn the entire budget before failing — the exact behaviour reported
+                  # from a 4.20 cluster: six minutes of "waiting for OLM to stage v1.19.1" with v1.20.0 up.
+                  log "WARNING: the cluster is running ${INSTALLED}, which is NEWER than operator.startingCSV (${APPROVE_CSV})."
+                  log "  OLM does not downgrade, so no InstallPlan for ${APPROVE_CSV} will ever be staged — that pin"
+                  log "  describes a past state. This Job approves nothing and the operator stays at ${INSTALLED}."
+                  log "  Adopt what is running, in git:  operator.startingCSV: ${INSTALLED}"
+                  log "  Not merely tidiness: startingCSV is where OLM BEGINS on a fresh install, so a reinstall"
+                  log "  would start at ${APPROVE_CSV} instead of ${INSTALLED}."
+                  log "  Going back to ${APPROVE_CSV} is not something this Job will do — OLM cannot downgrade, so"
+                  log "  the CSV would have to be removed and reinstalled, taking Argo CD down."
+                  log "  What is on offer: oc get packagemanifest ${SUBSCRIPTION} -n {{ .Values.operator.sourceNamespace }} -o 'custom-columns=CHANNEL:.status.channels[*].name,HEAD:.status.channels[*].currentCSV'"
+                  # Worth knowing while ahead: a FURTHER upgrade may already be staged and waiting.
+                  report_unapproved_others
+                  exit 0
+                fi
+                # BEHIND. The pin was moved forward in git and the cluster has not caught up — the normal
+                # upgrade path. OLM stages a plan for it and the loop below approves exactly that one.
+                log "installed ${INSTALLED} is older than the pin ${APPROVE_CSV} — this is an upgrade; waiting for OLM to stage it"
+              else
+                log "installedCSV=<none yet> — first install"
+              fi
+
+              # --- 3. find the plan for the pinned CSV, owned by OUR Subscription ---------------------
+              # Ownership matters: several operators can share a namespace, and approving another operator's
+              # InstallPlan would install software this chart knows nothing about.
+              echo "=== Waiting for an unapproved InstallPlan that installs ${APPROVE_CSV} ==="
+              TARGET=""
+              while :; do
+                # RE-READ installedCSV EVERY ITERATION, not once before the loop. OLM does not always stage
+                # an InstallPlan: when a CSV for the pinned version already exists in the namespace it can
+                # adopt it and set .status.installedCSV directly. An approver that read installedCSV once
+                # would then wait out its entire budget for a plan that is never coming and fail an install
+                # that had actually succeeded. Observed while testing a reinstall against a surviving CSV.
+                INSTALLED="$(oc get "$SUBS" "$SUBSCRIPTION" -n "$NAMESPACE" -o jsonpath='{.status.installedCSV}' 2>/dev/null || true)"
+                if [ "$INSTALLED" = "$APPROVE_CSV" ]; then
+                  log "OLM reports ${APPROVE_CSV} installed without staging an InstallPlan — nothing to approve"
+                  report_unapproved_others
+                  exit 0
+                fi
+                # A resolution failure will never produce an InstallPlan either, and waiting cannot fix it.
+                # The commonest cause is an orphaned CSV in the namespace that no Subscription owns: OLM
+                # reports `constraints not satisfiable: @existing/...` and stops. Measured on this cluster
+                # after deleting a Subscription but leaving its CSV behind.
+                RESOLVE="$(oc get "$SUBS" "$SUBSCRIPTION" -n "$NAMESPACE" -o jsonpath='{range .status.conditions[?(@.type=="ResolutionFailed")]}{.status}|{.message}{end}' 2>/dev/null || true)"
+                case "$RESOLVE" in
+                  True\|*)
+                    fail "OLM cannot resolve this Subscription, so no InstallPlan will ever appear:
+                  ${RESOLVE#True|}
+                An '@existing/...' constraint means a CSV for this operator is already in ${NAMESPACE} and is
+                owned by no Subscription — usually left behind when a previous Subscription was deleted. OLM
+                will not resolve past it. Remove it and re-run:
+                  oc delete ${CSVS} -n ${NAMESPACE} <the orphaned CSV>
+                Inspect: oc get ${CSVS} -n ${NAMESPACE}; oc get ${SUBS} ${SUBSCRIPTION} -n ${NAMESPACE} -o yaml" ;;
+                esac
+                for ip in $(oc get "$PLANS" -n "$NAMESPACE" -o name 2>/dev/null || true); do
+                  owner="$(oc get "$ip" -n "$NAMESPACE" -o jsonpath='{.metadata.ownerReferences[?(@.kind=="Subscription")].name}' 2>/dev/null || true)"
+                  case " $owner " in *" $SUBSCRIPTION "*) ;; *) continue ;; esac
+                  approved="$(oc get "$ip" -n "$NAMESPACE" -o jsonpath='{.spec.approved}' 2>/dev/null || true)"
+                  [ "$approved" = "true" ] && continue
+                  names="$(oc get "$ip" -n "$NAMESPACE" -o jsonpath='{.spec.clusterServiceVersionNames[*]}' 2>/dev/null || true)"
+                  case " $names " in
+                    *" $APPROVE_CSV "*) TARGET="$ip"; log "match: ${ip} installs [${names}]"; break ;;
+                    *) log "SKIP ${ip}: installs [${names}], not the pinned ${APPROVE_CSV} — left for a human" ;;
+                  esac
+                done
+                [ -n "$TARGET" ] && break
+                out_of_time && break
+                log "waiting for OLM to stage an InstallPlan for ${APPROVE_CSV} ..."
+                sleep 5
+              done
+              [ -n "$TARGET" ] || fail "no unapproved InstallPlan for ${APPROVE_CSV} appeared within ${WAIT_SECONDS}s.
+                Most often operator.startingCSV names a version this channel does not offer. Check what it does:
+                oc get packagemanifest ${SUBSCRIPTION} -n {{ .Values.operator.sourceNamespace }} \\
+                -o 'custom-columns=CHANNEL:.status.channels[*].name,HEAD:.status.channels[*].currentCSV'
+                And what OLM staged:  oc get ${PLANS} -n ${NAMESPACE} -o 'custom-columns=NAME:.metadata.name,CSV:.spec.clusterServiceVersionNames[*],APPROVED:.spec.approved'"
+
+              # --- 4. approve it ----------------------------------------------------------------------
+              log "approving ${TARGET}"
+              oc patch "$TARGET" -n "$NAMESPACE" --type merge -p '{"spec":{"approved":true}}' \
+                || fail "could not patch ${TARGET}. A Forbidden here means the Role lacks 'patch' on installplans.
+                Inspect: oc auth can-i patch ${PLANS} -n ${NAMESPACE}"
+
+              # --- 5. confirm it actually installed ---------------------------------------------------
+              # The patch returning is not the operator being installed. Reporting success at that point is
+              # how a gate becomes decorative.
+              echo "=== Waiting for ${APPROVE_CSV} to reach Succeeded ==="
+              PHASE=""
+              while :; do
+                PHASE="$(oc get "$CSVS" "$APPROVE_CSV" -n "$NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+                [ "$PHASE" = "Succeeded" ] && break
+                [ "$PHASE" = "Failed" ] && fail "${APPROVE_CSV} reported phase=Failed.
+                Inspect: oc describe ${CSVS} ${APPROVE_CSV} -n ${NAMESPACE}"
+                out_of_time && break
+                log "csv phase=${PHASE:-<not present yet>}"
+                sleep 5
+              done
+              [ "$PHASE" = "Succeeded" ] || fail "${APPROVE_CSV} did not reach Succeeded within ${WAIT_SECONDS}s (phase=${PHASE:-<none>}).
+                Inspect: oc get ${CSVS},${PLANS} -n ${NAMESPACE}"
+
+              log "OK: ${APPROVE_CSV} approved via ${TARGET} and installed"
+              report_unapproved_others
+{{- end }}

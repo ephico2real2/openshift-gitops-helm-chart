@@ -1,0 +1,24 @@
+openshift-gitops {{ .Chart.Version }} — release {{ .Release.Name }}
+
+Operator     : {{ .Values.operator.packageName }} ({{ .Values.operator.channel }}), pinned to {{ .Values.operator.startingCSV }}
+               in namespace {{ .Values.namespaces.operator }}, approval {{ .Values.operator.installPlanApproval }}
+Default Argo : {{ if .Values.defaultInstance.enabled }}kept — {{ .Values.defaultInstance.namespace }}/{{ .Values.defaultInstance.name }}{{ else }}DISABLED (DISABLE_DEFAULT_ARGOCD_INSTANCE=true){{ end }}
+cluster-admin: {{ if .Values.clusterAdmin.enabled }}granted to {{ .Values.defaultInstance.namespace }}/{{ include "openshift-gitops.controllerServiceAccount" . }}{{ else }}not granted by this chart{{ end }}
+
+{{- if .Values.verifyJob.enabled }}
+
+The release only reports success once the verify Job has proved the operator installed, the default
+instance Available and the grant effective. Its log is the place to look if the install stalls:
+
+  oc logs -n {{ .Values.namespaces.operator }} job/{{ .Release.Name }}-verify
+{{- end }}
+
+Where things are:
+
+  oc get subscriptions.operators.coreos.com -n {{ .Values.namespaces.operator }}
+  oc get argocds.argoproj.io -n {{ .Values.defaultInstance.namespace }}
+  oc get route -n {{ .Values.defaultInstance.namespace }} {{ .Values.defaultInstance.name }}-server -o jsonpath='{.spec.host}{"\n"}'
+  oc extract secret/{{ .Values.defaultInstance.name }}-cluster -n {{ .Values.defaultInstance.namespace }} --keys=admin.password --to=-
+
+To move the operator version: bump operator.startingCSV to the exact name the catalog serves, review,
+merge. The approver approves nothing else, so an InstallPlan for any other version waits for you.

@@ -1,0 +1,226 @@
+{{- if .Values.verifyJob.enabled }}
+# Readiness gate. Runs the OpenShift CLI to prove the operator is installed, the default Argo CD
+# instance is Available, and — when this chart granted it — that the application controller really
+# holds cluster-admin. A release that "succeeds" without this can leave every one of those false.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}-verify
+  namespace: {{ .Values.namespaces.operator }}
+  labels:
+    {{- include "openshift-gitops.labels" . | nindent 4 }}
+  annotations:
+    # Wave 2: after the binding (1). Under plain Helm the weight does the ordering; under ArgoCD the
+    # wave does. With no argocd hook annotation Argo treats this as an ordinary resource and the
+    # second sync fails on the immutable spec.template. HookSucceeded keeps a FAILED run's pod log,
+    # which for a staged readiness gate is the only place the reason lives.
+    argocd.argoproj.io/sync-wave: "2"
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation,HookSucceeded
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: {{ .Values.verifyJob.backoffLimit }}
+  # Above the script's own budget, so the script's message is the one you read rather than the
+  # kubelet killing the pod part-way with no explanation of its own.
+  activeDeadlineSeconds: {{ add .Values.verifyJob.timeoutSeconds 120 }}
+  template:
+    metadata:
+      labels:
+        {{- include "openshift-gitops.labels" . | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      {{- if .Values.verifyJob.rbac.create }}
+      serviceAccountName: {{ .Release.Name }}-verify
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      volumes:
+        - name: work
+          emptyDir:
+            medium: Memory
+      containers:
+        - name: verify
+          image: {{ .Values.verifyJob.image }}
+          imagePullPolicy: {{ .Values.verifyJob.imagePullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml .Values.verifyJob.resources | nindent 12 }}
+          volumeMounts:
+            - name: work
+              mountPath: /tmp
+          env:
+            # oc writes its discovery/OpenAPI cache here; /tmp is the writable emptyDir since the root
+            # filesystem is read-only.
+            - name: KUBECACHEDIR
+              value: /tmp/.kube/cache
+            # `required` on every identifier baked into the script. A misspelled values key renders as
+            # an EMPTY STRING without failing, and an empty identifier does not error either — it makes
+            # every query match nothing, so the Job burns its budget and blames OLM for a typo.
+            - name: OPERATOR_NS
+              value: {{ required "verifyJob: namespaces.operator must be set" .Values.namespaces.operator | quote }}
+            - name: SUBSCRIPTION
+              value: {{ required "verifyJob: operator.packageName must be set" .Values.operator.packageName | quote }}
+            - name: TIMEOUT
+              value: {{ required "verifyJob: verifyJob.timeoutSeconds must be set" .Values.verifyJob.timeoutSeconds | quote }}
+            # So a Forbidden message can print the exact `can-i` probe instead of a guess.
+            - name: SA_NAME
+              value: {{ .Release.Name }}-verify
+            - name: INSTANCE_ENABLED
+              value: {{ .Values.defaultInstance.enabled | quote }}
+            - name: INSTANCE_NS
+              value: {{ required "verifyJob: defaultInstance.namespace must be set" .Values.defaultInstance.namespace | quote }}
+            - name: INSTANCE_NAME
+              value: {{ required "verifyJob: defaultInstance.name must be set" .Values.defaultInstance.name | quote }}
+            - name: CONTROLLER_SA
+              value: {{ include "openshift-gitops.controllerServiceAccount" . | quote }}
+            - name: CLUSTER_ADMIN
+              value: {{ .Values.clusterAdmin.enabled | quote }}
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -uo pipefail
+              deadline=$(( $(date +%s) + TIMEOUT ))
+              log()  { echo "[verify $(date -u +%H:%M:%S)] $*"; }
+              fail() { echo "[verify] FAILED: $*" >&2; exit 1; }
+
+              # EVERY RESOURCE NAMED IN FULL. A plural is not reserved: measured on a live cluster in a
+              # sibling chart, `oc get subscription` bound to subscriptions.messaging.knative.dev and
+              # returned Forbidden — which reads as missing RBAC on the resource you meant. This container
+              # points KUBECACHEDIR at a fresh emptyDir, so discovery is COLD on every run and the binding
+              # is not stable even between two runs of this same Job. A misrouted LIST is worse: it
+              # returns nothing rather than failing.
+              SUBS=subscriptions.operators.coreos.com
+              CSVS=clusterserviceversions.operators.coreos.com
+              ARGOCDS=argocds.argoproj.io
+              ROUTES=routes.route.openshift.io
+              SAS=serviceaccounts
+
+              # A FAILED READ IS NOT A NEGATIVE ANSWER. Every `oc get` below keeps its exit status instead
+              # of `2>/dev/null || true`, which collapses "not there yet" (legitimate, keep waiting) with
+              # "Forbidden" and "wrong namespace" (fatal) into one empty string. NotFound during a wait is
+              # expected and loops; anything else aborts now and says what oc said.
+              is_notfound() { case "$1" in *NotFound*|*"not found"*) return 0 ;; *) return 1 ;; esac; }
+
+              log "1/5 waiting for Subscription/${SUBSCRIPTION} installedCSV in ${OPERATOR_NS} ..."
+              while :; do
+                if out=$(oc get "$SUBS" "${SUBSCRIPTION}" -n "${OPERATOR_NS}" -o jsonpath='{.status.installedCSV}' 2>&1); then
+                  csv="${out}"
+                  [ -n "${csv}" ] && break
+                elif is_notfound "${out}"; then
+                  fail "Subscription ${SUBSCRIPTION} does not exist in ${OPERATOR_NS}.
+                This Job is a post-install hook, so the Subscription was applied long before — check
+                operator.packageName and namespaces.operator against: oc get ${SUBS} -A"
+                else
+                  fail "could not read Subscription ${SUBSCRIPTION} in ${OPERATOR_NS}: ${out}
+                Inspect: oc auth can-i get ${SUBS} -n ${OPERATOR_NS} --as=system:serviceaccount:${OPERATOR_NS}:${SA_NAME}"
+                fi
+                [ "$(date +%s)" -ge "${deadline}" ] && fail "no installedCSV on Subscription/${SUBSCRIPTION} within ${TIMEOUT}s.
+                With installPlanApproval: Manual this usually means the InstallPlan was never approved — check
+                the installplan-approver Job's log, and: oc get installplans.operators.coreos.com -n ${OPERATOR_NS}"
+                sleep 5
+              done
+              log "    installedCSV=${csv}"
+
+              log "2/5 waiting for CSV/${csv} phase=Succeeded ..."
+              while :; do
+                if out=$(oc get "$CSVS" "${csv}" -n "${OPERATOR_NS}" -o jsonpath='{.status.phase}' 2>&1); then
+                  phase="${out}"
+                elif is_notfound "${out}"; then
+                  phase=""
+                else
+                  fail "could not read CSV ${csv} in ${OPERATOR_NS}: ${out}"
+                fi
+                log "    CSV phase=${phase:-<not present yet>}"
+                [ "${phase}" = "Succeeded" ] && break
+                [ "${phase}" = "Failed" ] && fail "CSV ${csv} reported phase=Failed.
+                Inspect: oc describe ${CSVS} ${csv} -n ${OPERATOR_NS}"
+                [ "$(date +%s)" -ge "${deadline}" ] && fail "CSV ${csv} did not reach Succeeded within ${TIMEOUT}s (phase=${phase:-<none>})"
+                sleep 10
+              done
+
+              if [ "${INSTANCE_ENABLED}" != "true" ]; then
+                log "3/5 default instance disabled by this chart (DISABLE_DEFAULT_ARGOCD_INSTANCE=true) — nothing to wait for"
+                log "4/5 skipped: no default instance, no controller ServiceAccount"
+                log "5/5 skipped: no default instance, no Route"
+                log "SUCCESS: operator installed; the default Argo CD instance is deliberately off"
+                exit 0
+              fi
+
+              log "3/5 waiting for ${ARGOCDS}/${INSTANCE_NAME} in ${INSTANCE_NS} to report phase=Available ..."
+              # THE OPERATOR'S OWN VERDICT. .status.phase goes Pending -> Available once every component
+              # it manages is up; the per-component entries are logged so a stall names the component
+              # rather than the instance.
+              while :; do
+                if out=$(oc get "$ARGOCDS" "${INSTANCE_NAME}" -n "${INSTANCE_NS}" -o jsonpath='{.status.phase}' 2>&1); then
+                  phase="${out}"
+                elif is_notfound "${out}"; then
+                  # Both the namespace and the CR are made by the operator after the CSV succeeds, so a
+                  # NotFound here is the normal cold-start state, not a misconfiguration.
+                  phase=""
+                else
+                  fail "could not read ${ARGOCDS}/${INSTANCE_NAME} in ${INSTANCE_NS}: ${out}
+                Inspect: oc auth can-i get ${ARGOCDS} -n ${INSTANCE_NS} --as=system:serviceaccount:${OPERATOR_NS}:${SA_NAME}"
+                fi
+                components=$(oc get "$ARGOCDS" "${INSTANCE_NAME}" -n "${INSTANCE_NS}" -o jsonpath='{.status.applicationController} {.status.server} {.status.repo} {.status.redis}' 2>/dev/null || true)
+                log "    phase=${phase:-<not present yet>} components(controller server repo redis)=[${components}]"
+                [ "${phase}" = "Available" ] && break
+                [ "${phase}" = "Failed" ] && fail "${ARGOCDS}/${INSTANCE_NAME} reported phase=Failed.
+                Inspect: oc describe ${ARGOCDS} ${INSTANCE_NAME} -n ${INSTANCE_NS}; oc get pods -n ${INSTANCE_NS}"
+                [ "$(date +%s)" -ge "${deadline}" ] && fail "${ARGOCDS}/${INSTANCE_NAME} not Available within ${TIMEOUT}s (phase=${phase:-<none>}).
+                If the CR never appeared: the operator's Deployment env has DISABLE_DEFAULT_ARGOCD_INSTANCE —
+                inspect: oc get deployment -n ${OPERATOR_NS} -o yaml | grep -A1 DISABLE_DEFAULT
+                Otherwise: oc get pods -n ${INSTANCE_NS}"
+                sleep 10
+              done
+
+              log "4/5 checking the application controller ServiceAccount ${INSTANCE_NS}/${CONTROLLER_SA} ..."
+              # The binding names it; the operator makes it. Available above means it should exist now,
+              # so this is a check with a short grace, not a wait.
+              for _ in 1 2 3 4 5 6; do
+                oc get "$SAS" "${CONTROLLER_SA}" -n "${INSTANCE_NS}" >/dev/null 2>&1 && break
+                sleep 5
+              done
+              oc get "$SAS" "${CONTROLLER_SA}" -n "${INSTANCE_NS}" >/dev/null 2>&1 \
+                || fail "ServiceAccount ${CONTROLLER_SA} not found in ${INSTANCE_NS} although the instance is Available.
+                The operator names it <instance>-argocd-application-controller; if that convention changed,
+                defaultInstance.name or the chart's helper is stale. Inspect: oc get ${SAS} -n ${INSTANCE_NS}"
+              PROVED=""
+              if [ "${CLUSTER_ADMIN}" = "true" ]; then
+                # THE GRANT, PROVED, NOT ASSUMED. A SubjectAccessReview asks the API server whether the
+                # controller may do '*' on '*' — exactly what cluster-admin means — without impersonating
+                # it. `allowed: true` is the only acceptable answer once the binding is applied.
+                SAR='{"apiVersion":"authorization.k8s.io/v1","kind":"SubjectAccessReview","spec":{"user":"system:serviceaccount:'"${INSTANCE_NS}"':'"${CONTROLLER_SA}"'","resourceAttributes":{"verb":"*","group":"*","resource":"*"}}}'
+                if ! allowed=$(printf '%s' "${SAR}" | oc create -f - -o jsonpath='{.status.allowed}' 2>&1); then
+                  fail "could not create a SubjectAccessReview: ${allowed}
+                Inspect: oc auth can-i create subjectaccessreviews.authorization.k8s.io --as=system:serviceaccount:${OPERATOR_NS}:${SA_NAME}"
+                fi
+                [ "${allowed}" = "true" ] || fail "the application controller does NOT hold cluster-admin (SubjectAccessReview allowed=${allowed}).
+                clusterAdmin.enabled is true, so the ClusterRoleBinding should be in this release.
+                Inspect: oc get clusterrolebinding -o wide | grep ${CONTROLLER_SA}"
+                log "    cluster-admin confirmed by SubjectAccessReview (allowed=true)"
+                PROVED=", cluster-admin proved"
+              else
+                log "    clusterAdmin.enabled is false — no grant to prove"
+              fi
+
+              log "5/5 the Argo CD server Route ..."
+              # Informational: the instance is Available, so the Route is expected; its absence is logged,
+              # not failed, because a cluster without the OpenShift router (or with a custom server exposure)
+              # is still a working Argo CD.
+              if host=$(oc get "$ROUTES" -n "${INSTANCE_NS}" -l app.kubernetes.io/name="${INSTANCE_NAME}-server" -o jsonpath='{.items[0].spec.host}' 2>&1) && [ -n "${host}" ]; then
+                log "    https://${host}"
+              else
+                log "    no server Route found in ${INSTANCE_NS} (${host:-empty}) — not a failure"
+              fi
+
+              log "SUCCESS: operator ${csv} installed, ${INSTANCE_NAME} Available, controller ServiceAccount present${PROVED}"
+{{- end }}
