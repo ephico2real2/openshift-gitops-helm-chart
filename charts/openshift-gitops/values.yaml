@@ -69,6 +69,32 @@ defaultInstance:
   # <name>-argocd-application-controller in <namespace>.
   namespace: openshift-gitops
   name: openshift-gitops
+  # The instance's RBAC (its argocd-rbac-cm), asserted by a post-install hook that patches spec.rbac
+  # on the ArgoCD CR the operator owns — idempotent, re-asserted on every upgrade. Measured on CRC
+  # 2026-09-19: the operator's default policy grants role:admin to the GROUPS system:cluster-admins
+  # and cluster-admins with scopes [groups] and no default role, but Dex's OpenShift connector puts
+  # only system:authenticated in a token's groups — kubeadmin's cluster-admin membership is a virtual
+  # group Dex never sees — so kubeadmin's UI session had NO role: PermissionDenied on every list, an
+  # empty Repositories and Applications page while both existed. `name` in scopes matches the token's
+  # name claim; the kubeadmin line grants it. Add your own groups (OpenShift Group objects DO reach
+  # Dex) or users below; an empty policy leaves the operator's default alone.
+  rbac:
+    enabled: true
+    scopes: "[groups, name]"
+    defaultPolicy: ""
+    policy: |
+      g, system:cluster-admins, role:admin
+      g, cluster-admins, role:admin
+      g, kubeadmin, role:admin
+    image: registry.redhat.io/openshift4/ose-cli:latest
+    imagePullPolicy: IfNotPresent
+    resources:
+      requests:
+        cpu: 25m
+        memory: 64Mi
+      limits:
+        cpu: 100m
+        memory: 128Mi
 
 # -----------------------------------------------------------------------------
 # cluster-admin for the application controller

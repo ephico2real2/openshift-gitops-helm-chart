@@ -4,6 +4,7 @@ Operator     : {{ .Values.operator.packageName }} ({{ .Values.operator.channel }
                in namespace {{ .Values.namespaces.operator }}, approval {{ .Values.operator.installPlanApproval }}
 Default Argo : {{ if .Values.defaultInstance.enabled }}kept — {{ .Values.defaultInstance.namespace }}/{{ .Values.defaultInstance.name }}{{ else }}DISABLED (DISABLE_DEFAULT_ARGOCD_INSTANCE=true){{ end }}
 cluster-admin: {{ if .Values.clusterAdmin.enabled }}granted to {{ .Values.defaultInstance.namespace }}/{{ include "openshift-gitops.controllerServiceAccount" . }}{{ else }}not granted by this chart{{ end }}
+UI RBAC      : {{ if and .Values.defaultInstance.enabled .Values.defaultInstance.rbac.enabled }}asserted on the instance by the rbac-patch hook (scopes {{ .Values.defaultInstance.rbac.scopes }}) — log out of the UI and back in after an install or upgrade{{ else }}the operator's default (kubeadmin's UI session gets NO role: Dex never sees its virtual cluster-admins group){{ end }}
 
 {{- if .Values.verifyJob.enabled }}
 

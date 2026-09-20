@@ -6,7 +6,7 @@ description: >-
   application controller to cluster-admin so it can manage the whole cluster.
 type: application
 # The CHART version. Bumped on every change to templates or defaults.
-version: 0.1.0
+version: 0.2.0
 # The operator channel this chart targets; the exact version is operator.startingCSV in values.yaml.
 appVersion: "latest"
 keywords:
