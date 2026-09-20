@@ -1,0 +1,130 @@
+{{- if and .Values.defaultInstance.enabled .Values.defaultInstance.rbac.enabled }}
+# Asserts the default instance's RBAC policy (values defaultInstance.rbac) on the ArgoCD CR the operator
+# owns, which the operator renders into argocd-rbac-cm. A hook AFTER the verify Job (weight 6 > 5;
+# Argo wave 3 > 2): the CR exists and is Available by then. `oc patch --type merge` is idempotent, so
+# every install and upgrade re-asserts the policy; nothing else about the CR is touched.
+#
+# WHY A PATCH AND NOT A RENDERED ArgoCD CR: this chart keeps the operator's default instance rather than
+# rendering its own, so the CR is the operator's object — a second manager of the same object would
+# fight it. One field, one patch.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Release.Name }}-rbac-patch
+  namespace: {{ .Values.defaultInstance.namespace }}
+  labels:
+    {{- include "openshift-gitops.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+---
+# get + patch on the ONE ArgoCD CR, by name; a Role, in the instance's namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Release.Name }}-rbac-patch
+  namespace: {{ .Values.defaultInstance.namespace }}
+  labels:
+    {{- include "openshift-gitops.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+rules:
+  - apiGroups: ["argoproj.io"]
+    resources: ["argocds"]
+    resourceNames: [{{ .Values.defaultInstance.name | quote }}]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Release.Name }}-rbac-patch
+  namespace: {{ .Values.defaultInstance.namespace }}
+  labels:
+    {{- include "openshift-gitops.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Release.Name }}-rbac-patch
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Release.Name }}-rbac-patch
+    namespace: {{ .Values.defaultInstance.namespace }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}-rbac-patch
+  namespace: {{ .Values.defaultInstance.namespace }}
+  labels:
+    {{- include "openshift-gitops.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation,HookSucceeded
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "6"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: 300
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        {{- include "openshift-gitops.labels" . | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ .Release.Name }}-rbac-patch
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      volumes:
+        - name: work
+          emptyDir:
+            medium: Memory
+      containers:
+        - name: rbac-patch
+          image: {{ .Values.defaultInstance.rbac.image }}
+          imagePullPolicy: {{ .Values.defaultInstance.rbac.imagePullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml .Values.defaultInstance.rbac.resources | nindent 12 }}
+          volumeMounts:
+            - name: work
+              mountPath: /tmp
+          env:
+            - name: KUBECACHEDIR
+              value: /tmp/.kube/cache
+            - name: INSTANCE_NS
+              value: {{ .Values.defaultInstance.namespace | quote }}
+            - name: INSTANCE_NAME
+              value: {{ .Values.defaultInstance.name | quote }}
+            # The patch, built by Helm so the policy is one YAML block in values and one JSON string here.
+            - name: PATCH
+              value: {{ dict "spec" (dict "rbac" (dict "scopes" .Values.defaultInstance.rbac.scopes "defaultPolicy" .Values.defaultInstance.rbac.defaultPolicy "policy" .Values.defaultInstance.rbac.policy)) | toJson | quote }}
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -euo pipefail
+              log()  { printf '[rbac-patch %s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
+              fail() { printf '[rbac-patch] FAILED: %s\n' "$*" >&2; exit 1; }
+              log "asserting spec.rbac on argocds.argoproj.io/${INSTANCE_NAME} in ${INSTANCE_NS}"
+              if out="$(oc patch argocds.argoproj.io "${INSTANCE_NAME}" -n "${INSTANCE_NS}" --type merge -p "${PATCH}" 2>&1)"; then
+                log "${out}"
+              else
+                fail "could not patch argocds.argoproj.io/${INSTANCE_NAME}: ${out}
+                A Forbidden means the Role above did not bind; a NotFound means the instance does not exist yet
+                (the verify Job runs before this one and waits for it)."
+              fi
+              # Read back what the operator will render into argocd-rbac-cm.
+              oc get argocds.argoproj.io "${INSTANCE_NAME}" -n "${INSTANCE_NS}" -o jsonpath='{.spec.rbac}' | sed 's/^/  spec.rbac: /'
+              echo
+              log "done — log out of the Argo CD UI and back in: the role is evaluated per session"
+{{- end }}

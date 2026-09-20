@@ -32,7 +32,7 @@ Job (`post-install`, weight 5), which waits for the CSV to succeed, the `ArgoCD`
 oc logs -n openshift-gitops-operator job/openshift-gitops-verify
 ```
 
-## The three decisions in `values.yaml`
+## The four decisions in `values.yaml`
 
 **`operator.installPlanApproval: Manual` with `operator.startingCSV` pinned.** `latest` is a rolling
 channel. Automatic approval would let a new GitOps release install itself onto the cluster that deploys
@@ -57,6 +57,18 @@ verify Job. It is the right default for a lab (CRC). On a shared cluster prefer 
 (`operator.clusterConfigNamespaces`, which is `ARGOCD_CLUSTER_CONFIG_NAMESPACES`) plus namespace-level
 `admin` grants, or a user-defined ClusterRole, and set this `false`.
 
+**`defaultInstance.rbac.enabled: true`.** The instance's UI/API RBAC, asserted by the `rbac-patch` hook
+(`oc patch argocds.argoproj.io openshift-gitops --type merge` on `spec.rbac`, which the operator renders
+into `argocd-rbac-cm`), idempotent on every install and upgrade. Needed because of a measured gap
+(CRC, 2026-09-19): the operator's default policy grants `role:admin` to the *groups*
+`system:cluster-admins` / `cluster-admins` with `scopes: [groups]` and no default role, but Dex's
+OpenShift connector puts only `system:authenticated` in a token's `groups` — kubeadmin's cluster-admin
+membership is a virtual group Dex never sees — so kubeadmin's UI session had no role at all:
+`PermissionDenied` on every list, empty Repositories and Applications pages while both existed. The
+default policy adds `name` to the scopes and `g, kubeadmin, role:admin`; add your own OpenShift Group
+objects (those do reach Dex) or users to `policy`. Log out of the UI and back in after the patch — the
+role is evaluated per session.
+
 ## Ordering
 
 | Wave | Weight | Object |
@@ -68,6 +80,8 @@ verify Job. It is the right default for a lab (CRC). On a shared cluster prefer 
 | 0 | -5 | installplan-approver Job — same wave as the Subscription deliberately; see the template for why a later wave can never become healthy |
 | 1 | | ClusterRoleBinding to `cluster-admin`; the verify Job's RBAC |
 | 2 | 5 | verify Job |
+| 1 | | the rbac-patch Job's RBAC (get/patch on the one ArgoCD CR, by name) |
+| 3 | 6 | rbac-patch Job — after the verify Job proved the instance Available |
 
 The Argo CD instance namespace `openshift-gitops` is **not** in the chart. The operator creates it with the
 instance and deletes it with the instance; a second owner would leave it behind unmanaged.
