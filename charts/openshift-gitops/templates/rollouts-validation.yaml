@@ -1,0 +1,17 @@
+{{- if not (kindIs "bool" .Values.rollouts.namespaceScoped) }}
+{{- fail "Red Hat Rollouts mode rule: rollouts.namespaceScoped must be a boolean; only one installation mode is allowed per cluster." }}
+{{- end }}
+{{- if and .Values.rollouts.namespaceScoped (not .Values.operator.enabled) }}
+{{- fail "Red Hat Rollouts mode rule: namespace-scoped mode requires NAMESPACE_SCOPED_ARGO_ROLLOUTS=true on the Subscription; rollouts.namespaceScoped=true requires operator.enabled=true so this chart can set it. Only one mode is allowed per cluster." }}
+{{- end }}
+{{- if .Values.rollouts.enabled }}
+{{- range $key := list "namespace" "name" }}
+{{- $value := index $.Values.rollouts $key }}
+{{- if or (not (kindIs "string" $value)) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" (toString $value))) (gt (len (toString $value)) 63) }}
+{{- fail (printf "rollouts.%s must be a nonempty DNS label of at most 63 characters" $key) }}
+{{- end }}
+{{- end }}
+{{- if not (regexMatch "^[1-9][0-9]*$" (toString .Values.rollouts.timeoutSeconds)) }}
+{{- fail "rollouts.timeoutSeconds must be a positive integer" }}
+{{- end }}
+{{- end }}

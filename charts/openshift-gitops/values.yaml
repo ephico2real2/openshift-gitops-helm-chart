@@ -54,6 +54,18 @@ operator:
   clusterConfigNamespaces:
     - openshift-gitops
 
+rollouts:
+  # Consumers need a controller before their Rollouts can progress.
+  enabled: true
+  # A dedicated namespace avoids sharing the operator-owned Argo CD lifecycle.
+  namespace: openshift-rollouts
+  # Red Hat's example name makes the instance easy to recognize.
+  name: argo-rollout
+  # Red Hat defaults to one controller managing Rollouts across the cluster.
+  namespaceScoped: false
+  # One bounded budget covers CRD establishment and controller readiness.
+  timeoutSeconds: 600
+
 # -----------------------------------------------------------------------------
 # The default Argo CD instance
 # The operator creates one ready-to-use instance in openshift-gitops unless told not to. This chart

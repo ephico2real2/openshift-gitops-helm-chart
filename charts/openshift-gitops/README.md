@@ -1,3 +1,65 @@
+# OpenShift GitOps: Argo Rollouts (chart 0.3.0)
+
+This chart now installs the Argo Rollouts controller for consumers such as
+group-sync-dashboard's blue-green Rollouts. Consumers create `Rollout` resources;
+the platform chart creates their shared `RolloutManager`.
+
+| Value | Default | Purpose |
+|---|---|---|
+| `rollouts.enabled` | `true` | Apply one RolloutManager and wait for `Available`. |
+| `rollouts.namespace` | `openshift-rollouts` | Dedicated namespace for the manager and controller. |
+| `rollouts.name` | `argo-rollout` | Red Hat's example instance name. |
+| `rollouts.namespaceScoped` | `false` | Cluster-scoped controller by default. |
+| `rollouts.timeoutSeconds` | `600` | Shared CRD/apply/readiness budget. |
+
+Red Hat allows only one Rollouts mode per cluster and only one cluster-scoped
+RolloutManager. `namespaceScoped=true` sets `NAMESPACE_SCOPED_ARGO_ROLLOUTS: "true"`
+on the Subscription and limits the controller to `rollouts.namespace`. Rendering
+rejects that mode with `operator.enabled=false`, since this chart must configure
+the required Subscription environment. Existing Subscription entries stay unchanged;
+with `namespaceScoped=false`, no Rollouts environment entry is added.
+
+Do not mix modes across releases or external installations. Remove existing managers
+and controllers before switching modes. Offline rendering cannot inspect the cluster;
+the cluster-scoped hook checks for another manager before applying, but does not lock
+out concurrent installs.
+
+The new Job runs on both post-install and post-upgrade (weight 7; Argo CD Sync wave 4),
+after the existing hooks. It waits for `rolloutmanagers.argoproj.io` to be Established,
+server-side applies the minimal `v1alpha1` manager with `spec: {}`, then waits for
+`status.phase=Available`. It fails with a stage-specific message on timeout and has a
+hard deadline of `timeoutSeconds + 120`. It reuses `verifyJob.image`,
+`verifyJob.imagePullPolicy` and `verifyJob.resources` with its own ServiceAccount,
+namespace-scoped write Role and read-only ClusterRole. No CRD capability guard skips
+the first install.
+
+The new namespace follows `namespaces.create` and `namespaces.protectOnUninstall`.
+Set `namespaces.create=false` for pre-created namespaces. Reusing the operator
+namespace does not render a duplicate. The default Argo CD namespace stays
+operator-owned; pre-create it before a first Helm install if selecting it as the
+Rollouts namespace, because ordinary hook RBAC needs its namespace to exist.
+
+```bash
+oc get rolloutmanagers.argoproj.io -A
+oc get deployment argo-rollouts -n openshift-rollouts
+oc rollout status deployment/argo-rollouts -n openshift-rollouts --timeout=120s
+oc logs -n openshift-rollouts job/openshift-gitops-rollouts
+```
+
+Expect manager phase `Available` and Deployment readiness `1/1`. Substitute your
+configured namespace/release name. `rollouts.enabled=false` omits all new Rollouts
+resources; with other defaults, the render matches chart 0.2.0 except version labels.
+The applied manager is outside Helm's resource inventory, so disabling the feature,
+uninstalling, or changing its name/namespace does not delete the old manager.
+Explicitly remove it before moving the controller or changing mode.
+
+See the [OpenShift GitOps installation and ordering guide](https://github.com/ephico2real2/openshift-gitops-helm-chart/blob/main/README.md).
+
+---
+
+The material below is inherited cert-manager documentation and does not describe
+this chart's GitOps resources or values.
+
 # cert-manager-venafi
 
 Installs the **cert-manager Operator for Red Hat OpenShift**, injects the trusted

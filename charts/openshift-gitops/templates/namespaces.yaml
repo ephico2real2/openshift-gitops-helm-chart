@@ -25,3 +25,21 @@ metadata:
     openshift.io/cluster-monitoring: "true"
     {{- include "openshift-gitops.labels" . | nindent 4 }}
 {{- end }}
+{{- if and .Values.namespaces.create .Values.rollouts.enabled (ne .Values.rollouts.namespace .Values.namespaces.operator) (not (and .Values.defaultInstance.enabled (eq .Values.rollouts.namespace .Values.defaultInstance.namespace))) }}
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Values.rollouts.namespace }}
+  annotations:
+    # The namespace must exist before the hook's ordinary RBAC is applied.
+    argocd.argoproj.io/sync-wave: "-2"
+    {{- if .Values.namespaces.protectOnUninstall }}
+    # Keeping the namespace preserves the controller and tenant resources on uninstall.
+    helm.sh/resource-policy: keep
+    {{- end }}
+  labels:
+    kubernetes.io/metadata.name: {{ .Values.rollouts.namespace }}
+    openshift.io/cluster-monitoring: "true"
+    {{- include "openshift-gitops.labels" . | nindent 4 }}
+{{- end }}

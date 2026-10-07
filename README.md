@@ -32,7 +32,7 @@ Job (`post-install`, weight 5), which waits for the CSV to succeed, the `ArgoCD`
 oc logs -n openshift-gitops-operator job/openshift-gitops-verify
 ```
 
-## The four decisions in `values.yaml`
+## The decisions in `values.yaml`
 
 **`operator.installPlanApproval: Manual` with `operator.startingCSV` pinned.** `latest` is a rolling
 channel. Automatic approval would let a new GitOps release install itself onto the cluster that deploys
@@ -69,11 +69,60 @@ default policy adds `name` to the scopes and `g, kubeadmin, role:admin`; add you
 objects (those do reach Dex) or users to `policy`. Log out of the UI and back in after the patch — the
 role is evaluated per session.
 
+## Argo Rollouts
+
+`rollouts.enabled: true` deploys one `RolloutManager` named `argo-rollout` in
+`openshift-rollouts`. The dedicated namespace keeps the controller separate from the
+operator-owned Argo CD namespace. Consumers such as group-sync-dashboard create their
+blue-green `Rollout` resources and use this controller; they do not create a RolloutManager.
+Set `rollouts.enabled=false` to omit the new namespace, RBAC and hook.
+
+Red Hat permits **only one Rollouts installation mode per cluster**, with **one
+cluster-scoped RolloutManager** by default. `rollouts.namespaceScoped: false` keeps the
+Subscription unchanged. Setting it to `true` adds `NAMESPACE_SCOPED_ARGO_ROLLOUTS: "true"`
+to the Subscription: the controller then manages Rollouts only in `rollouts.namespace`.
+That setting requires `operator.enabled=true`; rendering fails with the Red Hat mode rule
+if the chart cannot configure the Subscription. The chart accepts one manager and one mode,
+not a list of competing modes. Before changing mode, remove existing managers/controllers
+and coordinate the cluster-wide change; an offline render cannot discover other releases
+or externally installed controllers. The cluster-scoped hook also refuses to apply when it
+finds any other RolloutManager. This inventory check does not serialize concurrent installs.
+
+The `post-install,post-upgrade` hook (weight 7, Argo CD Sync wave 4) follows the existing
+approver, verify and RBAC-patch hooks. It polls the OLM-provided CRD until `Established`,
+server-side applies `argoproj.io/v1alpha1` / `RolloutManager` with `spec: {}`, then polls
+`status.phase` until `Available`. A single `rollouts.timeoutSeconds` budget (600 seconds)
+covers those steps; API requests have timeouts and the Job has a 720-second hard deadline.
+This path runs on both a fresh install and an upgrade, including when the CRD was absent
+at render time. It uses `verifyJob.image`, `imagePullPolicy` and `resources`, even if the
+verify Job is disabled, with its own ServiceAccount and narrowly scoped RBAC.
+
+`namespaces.create` and `namespaces.protectOnUninstall` also govern the new namespace.
+When namespaces are pre-created, set `namespaces.create=false`. Choosing the existing
+operator namespace reuses it; the chart never takes ownership of the default Argo CD
+namespace. If choosing that operator-owned namespace, it must already exist before Helm
+applies the ordinary hook RBAC (as with the existing RBAC-patch hook).
+
+Verify with the configured namespace (defaults below):
+
+```bash
+oc get rolloutmanagers.argoproj.io -A
+oc get deployment argo-rollouts -n openshift-rollouts
+oc rollout status deployment/argo-rollouts -n openshift-rollouts --timeout=120s
+oc logs -n openshift-rollouts job/openshift-gitops-rollouts
+```
+
+Expect manager phase `Available` and Deployment readiness `1/1`. The hook log remains for
+up to an hour under Helm. The manager is applied by the Job and is not in Helm's resource
+inventory: disabling Rollouts, changing its name/namespace, or uninstalling the chart does
+not delete it. Remove the old manager explicitly before moving it or changing modes;
+otherwise its controller remains (with the namespace protected by default).
+
 ## Ordering
 
 | Wave | Weight | Object |
 |---|---|---|
-| -2 | | Namespace `openshift-gitops-operator` (kept on uninstall) |
+| -2 | | Namespaces `openshift-gitops-operator` and `openshift-rollouts` (kept on uninstall) |
 | -1 | | OperatorGroup (AllNamespaces — the operator's only install mode) |
 | 0 | | Subscription |
 | 0 | -6 | csv-reclaim Job — clears a CSV a previous uninstall left behind, which would otherwise block resolution forever |
@@ -82,6 +131,8 @@ role is evaluated per session.
 | 2 | 5 | verify Job |
 | 1 | | the rbac-patch Job's RBAC (get/patch on the one ArgoCD CR, by name) |
 | 3 | 6 | rbac-patch Job — after the verify Job proved the instance Available |
+| 1 | | Rollouts hook ServiceAccount, Role/Binding and ClusterRole/Binding |
+| 4 | 7 | Rollouts Job — CRD Established, manager applied, phase Available |
 
 The Argo CD instance namespace `openshift-gitops` is **not** in the chart. The operator creates it with the
 instance and deletes it with the instance; a second owner would leave it behind unmanaged.

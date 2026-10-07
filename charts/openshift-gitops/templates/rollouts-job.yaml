@@ -1,0 +1,144 @@
+{{- if .Values.rollouts.enabled }}
+# OLM installs the CRD asynchronously, so the CR must be applied after establishment.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}-rollouts
+  namespace: {{ .Values.rollouts.namespace }}
+  labels:
+    {{- include "openshift-gitops.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "4"
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation,HookSucceeded
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "7"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  backoffLimit: 0
+  # Grace lets the script report its timeout before Kubernetes terminates the Pod.
+  activeDeadlineSeconds: {{ add .Values.rollouts.timeoutSeconds 120 }}
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        {{- include "openshift-gitops.labels" . | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ .Release.Name }}-rollouts
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      volumes:
+        - name: work
+          emptyDir:
+            medium: Memory
+      containers:
+        - name: rollouts
+          image: {{ .Values.verifyJob.image }}
+          imagePullPolicy: {{ .Values.verifyJob.imagePullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml .Values.verifyJob.resources | nindent 12 }}
+          volumeMounts:
+            - name: work
+              mountPath: /tmp
+          env:
+            - name: KUBECACHEDIR
+              value: /tmp/.kube/cache
+            - name: NAMESPACE
+              value: {{ .Values.rollouts.namespace | quote }}
+            - name: MANAGER
+              value: {{ .Values.rollouts.name | quote }}
+            - name: NAMESPACE_SCOPED
+              value: {{ .Values.rollouts.namespaceScoped | quote }}
+            - name: TIMEOUT
+              value: {{ .Values.rollouts.timeoutSeconds | quote }}
+            - name: MANIFEST
+              value: {{ dict "apiVersion" "argoproj.io/v1alpha1" "kind" "RolloutManager" "metadata" (dict "name" .Values.rollouts.name "namespace" .Values.rollouts.namespace) "spec" (dict) | toJson | quote }}
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -uo pipefail
+              : "${NAMESPACE:?}" "${MANAGER:?}" "${NAMESPACE_SCOPED:?}" "${TIMEOUT:?}" "${MANIFEST:?}"
+              log() { printf '[rollouts] %s\n' "$*"; }
+              fail() { log "FAILED: $*" >&2; exit 1; }
+              deadline=$(( $(date +%s) + TIMEOUT ))
+              stage="CRD establishment"
+              last="no response yet"
+              check_budget() {
+                remaining=$(( deadline - $(date +%s) ))
+                [ "$remaining" -gt 0 ] || fail "${stage} timed out within ${TIMEOUT}s: ${last}"
+              }
+              # Per-request limits keep an unreachable API inside the overall budget.
+              cli() {
+                local remaining request_timeout
+                remaining=$(( deadline - $(date +%s) ))
+                [ "$remaining" -gt 0 ] || return 124
+                request_timeout=$remaining
+                [ "$request_timeout" -le 10 ] || request_timeout=10
+                oc --request-timeout="${request_timeout}s" "$@"
+              }
+              retry() {
+                case "$last" in
+                  *Forbidden*|*Unauthorized*) fail "${stage}: ${last}" ;;
+                esac
+                check_budget
+                log "waiting for ${stage}: ${last:-<not ready>}"
+                if [ "$remaining" -lt 5 ]; then sleep "$remaining"; else sleep 5; fi
+              }
+
+              log "waiting for rolloutmanagers.argoproj.io Established (budget ${TIMEOUT}s)"
+              while :; do
+                check_budget
+                if last=$(cli get customresourcedefinitions.apiextensions.k8s.io rolloutmanagers.argoproj.io \
+                    -o 'jsonpath={.status.conditions[?(@.type=="Established")].status}' 2>&1) && [ "$last" = "True" ]; then
+                  break
+                fi
+                retry
+              done
+
+              if [ "$NAMESPACE_SCOPED" = "false" ]; then
+                stage="cluster-scoped singleton check"
+                while :; do
+                  check_budget
+                  if last=$(cli get rolloutmanagers.argoproj.io -A \
+                      -o 'jsonpath={range .items[*]}{.metadata.namespace}{"/"}{.metadata.name}{"\n"}{end}' 2>&1); then
+                    break
+                  fi
+                  retry
+                done
+                while IFS= read -r existing; do
+                  [ -z "$existing" ] || [ "$existing" = "${NAMESPACE}/${MANAGER}" ] \
+                    || fail "Red Hat Rollouts mode rule: only one cluster-scoped RolloutManager is supported; found ${existing}, refusing ${NAMESPACE}/${MANAGER}."
+                done <<< "$last"
+              fi
+
+              stage="RolloutManager apply"
+              # Discovery and admission may lag CRD establishment briefly.
+              while :; do
+                check_budget
+                if last=$(printf '%s\n' "$MANIFEST" | cli apply --server-side --field-manager=openshift-gitops-rollouts --validate=false -f - 2>&1); then
+                  log "$last"
+                  break
+                fi
+                retry
+              done
+
+              stage="RolloutManager ${NAMESPACE}/${MANAGER} phase Available"
+              while :; do
+                check_budget
+                if last=$(cli get rolloutmanagers.argoproj.io "$MANAGER" -n "$NAMESPACE" -o 'jsonpath={.status.phase}' 2>&1); then
+                  [ "$last" = "Available" ] && break
+                  [ "$last" != "Failed" ] || fail "${stage}: operator reported Failed; inspect oc describe rolloutmanagers.argoproj.io ${MANAGER} -n ${NAMESPACE}"
+                fi
+                retry
+              done
+              log "SUCCESS: RolloutManager ${NAMESPACE}/${MANAGER} is Available"
+{{- end }}

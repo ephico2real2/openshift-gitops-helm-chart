@@ -1,0 +1,88 @@
+{{- if .Values.rollouts.enabled }}
+# Ordinary RBAC exists before hooks and is reconciled with the release.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Release.Name }}-rollouts
+  namespace: {{ .Values.rollouts.namespace }}
+  labels:
+    {{- include "openshift-gitops.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Release.Name }}-rollouts
+  namespace: {{ .Values.rollouts.namespace }}
+  labels:
+    {{- include "openshift-gitops.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+rules:
+  # Existing-object access is restricted to the configured manager.
+  - apiGroups: ["argoproj.io"]
+    resources: ["rolloutmanagers"]
+    resourceNames: [{{ .Values.rollouts.name | quote }}]
+    verbs: ["get", "patch"]
+  # Kubernetes cannot restrict create by resourceNames, so creation stays namespace-scoped.
+  - apiGroups: ["argoproj.io"]
+    resources: ["rolloutmanagers"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Release.Name }}-rollouts
+  namespace: {{ .Values.rollouts.namespace }}
+  labels:
+    {{- include "openshift-gitops.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Release.Name }}-rollouts
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Release.Name }}-rollouts
+    namespace: {{ .Values.rollouts.namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Release.Name }}-rollouts
+  labels:
+    {{- include "openshift-gitops.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+rules:
+  # Polling the named CRD avoids broad discovery-object or watch permissions.
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    resourceNames: ["rolloutmanagers.argoproj.io"]
+    verbs: ["get"]
+  {{- if not .Values.rollouts.namespaceScoped }}
+  # A cluster-wide inventory prevents creating a second cluster-scoped manager.
+  - apiGroups: ["argoproj.io"]
+    resources: ["rolloutmanagers"]
+    verbs: ["list"]
+  {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Release.Name }}-rollouts
+  labels:
+    {{- include "openshift-gitops.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ .Release.Name }}-rollouts
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Release.Name }}-rollouts
+    namespace: {{ .Values.rollouts.namespace }}
+{{- end }}
